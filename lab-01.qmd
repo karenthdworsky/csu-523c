@@ -1,0 +1,11 @@
+---
+title: "lab-01.qmd"
+format: html
+editor: visual
+---
+
+## Quarto
+
+![](images/clipboard-788861053.png)
+
+![![](images/clipboard-522472492.png)](images/clipboard-1465438553.png)
