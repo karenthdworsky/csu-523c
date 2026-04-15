@@ -1,0 +1,697 @@
+---
+title: "lab-03"
+format: html
+editor: visual
+---
+
+## Question 1
+
+### 1.1
+
+```{r}
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(rmapshaper)
+library(mapview)
+# install.packages("remotes")  # if you don't have it
+remotes::install_github("mikejohnson51/AOI")
+
+
+# Get CONUS counties and project to Albers Equal Area (EPSG:5070)
+counties <- AOI::aoi_get(state = "conus", county = "all") |>
+  st_transform(5070)
+```
+
+### 1.2
+
+```{r}
+# Generate centroids, then union into a single MULTIPOINT
+county_centroids <- st_centroid(counties)
+
+centroids_union <- st_union(county_centroids)   # → sfc MULTIPOINT
+```
+
+### 1.3
+
+```{r}
+# ── Voronoi ────────────────────────────────────────────────────────────────
+voronoi <- st_voronoi(centroids_union) |>
+  st_cast() |>                    # simplify GEOMETRYCOLLECTION → POLYGON
+  st_as_sf() |>
+  mutate(id = 1:n())
+
+# ── Delaunay triangulation ─────────────────────────────────────────────────
+triangulate <- st_triangulate(centroids_union) |>
+  st_cast() |>
+  st_as_sf() |>
+  mutate(id = 1:n())
+
+# ── Square grid (n = 70 cells along longest dimension) ─────────────────────
+sq_grid <- st_make_grid(counties, n = 70, square = TRUE) |>
+  st_as_sf() |>
+  mutate(id = 1:n())
+
+# ── Hexagonal grid ─────────────────────────────────────────────────────────
+hex_grid <- st_make_grid(counties, n = 70, square = FALSE) |>
+  st_as_sf() |>
+  mutate(id = 1:n())
+```
+
+### 1.4
+
+```{r}
+conus_boundary <- st_union(counties)   # single POLYGON / MULTIPOLYGON
+```
+
+### 1.5
+
+```{r}
+# Report original vertex count
+original_pts <- mapview::npts(conus_boundary)
+
+# Simplify — retain 1% of vertices via Visvalingam (ms_simplify default)
+conus_simple <- rmapshaper::ms_simplify(conus_boundary, keep = 0.01, keep_shapes = TRUE)
+
+simplified_pts <- mapview::npts(conus_simple)
+
+cat("Original vertices:  ", original_pts, "\n")
+cat("Simplified vertices:", simplified_pts, "\n")
+cat("Points removed:     ", original_pts - simplified_pts, "\n")
+```
+
+```{r}
+# Check boundary is still valid
+st_is_valid(conus_simple)
+
+# Confirm dams (loaded later) still fall within simplified boundary
+# dams_in_boundary <- st_filter(dams, conus_simple)
+# nrow(dams_in_boundary) == nrow(dams)   # should be TRUE
+```
+
+```{r}
+# Voronoi & Delaunay → st_intersection() (tiles extend beyond CONUS)
+voronoi_clip    <- st_intersection(voronoi,    conus_simple) |> st_cast()
+triangulate_clip <- st_intersection(triangulate, conus_simple) |> st_cast()
+
+# Square & Hexagonal grids → st_filter() (keep complete tiles touching CONUS)
+sq_grid_clip  <- st_filter(sq_grid,  conus_simple)
+hex_grid_clip <- st_filter(hex_grid, conus_simple)
+```
+
+After simplification using visvaligngam with the keep=0.01 the original CONUS boundary contained 11292 vertices and the simplified boundary had 114 vertices which is removing almost 99% or the original geometry. This reduction has serious computational consequence. It accelerates the st_intersection() calls used to clip the Voronoi and Delaunay tessellations. For the regular grids clipped with st_filter() the simiplfication doesnt have any effect though since this filtering only tests whether the tiles touch the boundary as opposed to computing the exact geometry. The tradeoff is some minor inaccuracy around the Great Lakes and some parts of the shoreline. This matters less since we are interested in Dams here and those aren't on the ocean.
+
+### 1.6
+
+```{r}
+plot_tess <- function(sf_obj, title_str) {
+  ggplot(data = sf_obj) +
+    geom_sf(fill = "white", color = "navy", linewidth = 0.2) +
+    theme_void() +
+    labs(
+      title = title_str,
+      caption = paste("Number of features:", nrow(sf_obj))
+    )
+}
+```
+
+### 1.7
+
+```{r}
+plot_tess(counties,          "CONUS Counties")
+plot_tess(voronoi_clip,      "Voronoi Tessellation")
+plot_tess(triangulate_clip,  "Delaunay Triangulation")
+plot_tess(sq_grid_clip,      "Square Grid (n = 70)")
+plot_tess(hex_grid_clip,     "Hexagonal Grid (n = 70)")
+```
+
+```{r}
+library(patchwork)
+
+p1 <- plot_tess(counties,         "CONUS Counties")
+p2 <- plot_tess(voronoi_clip,     "Voronoi Tessellation")
+p3 <- plot_tess(triangulate_clip, "Delaunay Triangulation")
+p4 <- plot_tess(sq_grid_clip,     "Square Grid (n = 70)")
+p5 <- plot_tess(hex_grid_clip,    "Hexagonal Grid (n = 70)")
+
+(p1 | p2 | p3) / (p4 | p5)
+```
+
+## Question 2
+
+### 2.1
+
+```{r}
+sum_tess <- function(sf_obj, description) {
+  
+  area_km2 <- st_area(sf_obj) |>        # compute area (units object)
+    units::set_units("km^2") |>          # convert to km²
+    units::drop_units()                  # drop units class → plain numeric
+  
+  data.frame(
+    tessellation  = description,
+    n_features    = nrow(sf_obj),
+    mean_area_km2 = mean(area_km2),
+    sd_area_km2   = sd(area_km2),
+    total_area_km2 = sum(area_km2)
+  )
+}
+```
+
+### 2.2
+
+```{r}
+sum_counties   <- sum_tess(counties,         "Counties")
+sum_voronoi    <- sum_tess(voronoi_clip,     "Voronoi")
+sum_delaunay   <- sum_tess(triangulate_clip, "Delaunay Triangulation")
+sum_sq         <- sum_tess(sq_grid_clip,     "Square Grid (n = 70)")
+sum_hex        <- sum_tess(hex_grid_clip,    "Hexagonal Grid (n = 70)")
+```
+
+### 2.3
+
+```{r}
+tess_summary <- bind_rows(
+  sum_counties,
+  sum_voronoi,
+  sum_delaunay,
+  sum_sq,
+  sum_hex
+)
+```
+
+### 2.4
+
+```{r}
+knitr::kable(
+  tess_summary,
+  col.names   = c("Tessellation", "N Features",
+                  "Mean Area (km²)", "SD Area (km²)",
+                  "Total Area (km²)"),
+  digits      = 1,
+  format.args = list(big.mark = ","),
+  caption     = "Summary of CONUS tessellated surfaces"
+)
+```
+
+### 2.5
+
+The five tessellations differ a lot in the feature count, mean tile area and the variance. these differences end up shaping the results of any point in polygon analysis through MAUP. Counties exhibit the largest std dev of tile area in the dataset. The Voronoi tessellation anchors tile boundaries to county centroids which produces small tiles on the east coast and larger in teh west. The introduces a bias because it aggregates dams across multiple hydrologic regions which obscures variation. The Delaunay triangulation produces the most tiles and the smallest mean area which make the largest computational cost. The square and hexagonal grids have almost zero within tessallation variance by construction which eliminates the size driven MAUP artifact. This makes them the best choice for comparing dam density across regions. the hexagonal grid has better geometric advantage over square because there are 6 equidistant neighbors rather four for the square.
+
+## Question 3
+
+### 3.1
+
+```{r}
+library(readr)
+install.packages("janitor")
+library(janitor)
+
+nid_url  <- "https://nid.sec.usace.army.mil/api/nation/csv"
+dir.create("data", showWarnings = FALSE)
+nid_dest <- "data/nation.csv"
+
+if (file.exists(nid_dest)) {
+  message("Using local NID file: ", nid_dest)
+} else {
+  tryCatch({
+    message("Downloading NID CSV to: ", nid_dest)
+    download.file(nid_url, nid_dest, quiet = FALSE, mode = "wb")
+  }, error = function(e) {
+    message("NID download failed: ", e$message)
+  })
+}
+
+if (!file.exists(nid_dest)) stop("NID CSV not found at ", nid_dest)
+
+dams_raw <- read_csv(nid_dest, skip = 1, show_col_types = FALSE) |>
+  clean_names()
+
+# CONUS boundary (reuse from Q1 or rebuild)
+usa <- AOI::aoi_get(state = "conus") |>
+  st_union() |>
+  st_transform(5070)
+
+dams <- dams_raw |>
+  filter(!is.na(latitude)) |>
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) |>
+  st_transform(5070) |>
+  st_filter(usa)
+```
+
+### 3.2
+
+```{r}
+point_in_polygon <- function(points, polygons, id_col) {
+  polygons |>
+    st_join(points) |>
+    st_drop_geometry() |>
+    count(.data[[id_col]]) |>
+    left_join(polygons, by = id_col) |>
+    st_as_sf()
+}
+```
+
+### 3.3
+
+```{r}
+dams_counties    <- point_in_polygon(dams, counties,         "id")
+dams_voronoi     <- point_in_polygon(dams, voronoi_clip,     "id")
+dams_delaunay    <- point_in_polygon(dams, triangulate_clip, "id")
+dams_sq          <- point_in_polygon(dams, sq_grid_clip,     "id")
+dams_hex         <- point_in_polygon(dams, hex_grid_clip,    "id")
+```
+
+### 3.4
+
+```{r}
+plot_dam_density <- function(sf_obj, title_str) {
+  ggplot(data = sf_obj) +
+    geom_sf(aes(fill = n), color = NA) +
+    scale_fill_viridis_c(name = "Dam count") +
+    theme_void() +
+    labs(
+      title   = title_str,
+      caption = paste("Total dams:", sum(sf_obj$n, na.rm = TRUE))
+    )
+}
+```
+
+### 3.5
+
+```{r}
+plot_dam_density(dams_counties,  "Dam Density — Counties")
+plot_dam_density(dams_voronoi,   "Dam Density — Voronoi")
+plot_dam_density(dams_delaunay,  "Dam Density — Delaunay Triangulation")
+plot_dam_density(dams_sq,        "Dam Density — Square Grid (n = 70)")
+plot_dam_density(dams_hex,       "Dam Density — Hexagonal Grid (n = 70)")
+```
+
+```{r}
+p1 <- plot_dam_density(dams_counties,  "Counties")
+p2 <- plot_dam_density(dams_voronoi,   "Voronoi")
+p3 <- plot_dam_density(dams_delaunay,  "Delaunay")
+p4 <- plot_dam_density(dams_sq,        "Square Grid")
+p5 <- plot_dam_density(dams_hex,       "Hexagonal Grid")
+
+(p1 | p2 | p3) / (p4 | p5)
+```
+
+### 3.6
+
+#### 3.6a
+
+```{r}
+library(patchwork)
+
+p1 <- plot_dam_density(dams_counties,  "Counties")
+p2 <- plot_dam_density(dams_voronoi,   "Voronoi")
+p3 <- plot_dam_density(dams_delaunay,  "Delaunay Triangulation")
+p4 <- plot_dam_density(dams_sq,        "Square Grid (n = 70)")
+p5 <- plot_dam_density(dams_hex,       "Hexagonal Grid (n = 70)")
+
+(p1 | p2 | p3) / (p4 | p5) +
+  plot_annotation(
+    title    = "Dam Density Across Five Tessellation Methods",
+    caption  = "National Dam Inventory — USACE | EPSG:5070"
+  )
+```
+
+#### 3.6 b/c
+
+Two regions where tessellation choice produced substatially different pattern are the upper Midwest/Ohio River Valley and Colorado. The upper midwest has the densest dam concentration in CONUS. The county tessellation breaks the cluster into a bunch of small high count polygons that are aligned with county lines. This make really visually apparent but are artificially bounded by political geometry. The square and hexagonal grids aggregate the same concentration into a smaller number of large bright cells which conveys the regional magnitude while obscuring the county level variation. In Colorado River basin the county tessellation assigns super high dam counts to a small number of geographically huge counties which suggests an extreme concentration when the infrastructure is actually dispersed across a large river system across multiple states. the Delaunay triangulation with the smallest mean area and highest feature count subdivides this same space into many triangulations which does a better job at reflecting the distribution of the infrastructure. This is MAUP scale effect operating. For a dam manger focused on geographic clustering I think hexagonal grid would be the primary tessellation to recommend.
+
+## Question 4
+
+### 4.1
+
+```{r}
+# Filter to each purpose using grepl
+dams_hydro   <- dams |> filter(grepl("H", purposes))
+dams_irrig   <- dams |> filter(grepl("I", purposes))
+dams_flood   <- dams |> filter(grepl("C", purposes))
+dams_supply  <- dams |> filter(grepl("S", purposes))
+
+# Quick count check
+cat("Hydroelectric: ", nrow(dams_hydro),  "\n")
+cat("Irrigation:    ", nrow(dams_irrig),  "\n")
+cat("Flood Control: ", nrow(dams_flood),  "\n")
+cat("Water Supply:  ", nrow(dams_supply), "\n")
+
+# Point-in-polygon counts on hex grid (chosen tessellation from Q3)
+pip_hydro  <- point_in_polygon(dams_hydro,  hex_grid_clip, "id")
+pip_irrig  <- point_in_polygon(dams_irrig,  hex_grid_clip, "id")
+pip_flood  <- point_in_polygon(dams_flood,  hex_grid_clip, "id")
+pip_supply <- point_in_polygon(dams_supply, hex_grid_clip, "id")
+```
+
+### 4.2
+
+```{r}
+library(gghighlight)
+
+# Threshold helper — mean + 1 SD
+threshold <- function(x) mean(x, na.rm = TRUE) + sd(x, na.rm = TRUE)
+
+ph <- plot_dam_density(pip_hydro,  "Hydroelectric (H)") +
+  gghighlight(n > threshold(n))
+
+pi <- plot_dam_density(pip_irrig,  "Irrigation (I)") +
+  gghighlight(n > threshold(n))
+
+pc <- plot_dam_density(pip_flood,  "Flood Control (C)") +
+  gghighlight(n > threshold(n))
+
+ps <- plot_dam_density(pip_supply, "Water Supply (S)") +
+  gghighlight(n > threshold(n))
+
+(ph | pi) / (pc | ps) +
+  plot_annotation(
+    title   = "Dam Purpose Hotspots (tiles > mean + 1 SD highlighted)",
+    caption = "National Dam Inventory — USACE | Hexagonal Grid (n = 70)"
+  )
+```
+
+### 4.3
+
+The hydroelectric dams are clustered in the Pacific Northwest and New England. Both regions tend to have high gradient and relatively high consistent discharge that make these economically viable. The absence of hydroelectric in the Great Plains or Southwest reflects either low topography or streamflow that's too variable making it economically unviable. Irrigation dams have the a significant concentration in the west, particularly in Colorado, Idaho and California. These are places that can really have varying degrees or water ina given year and therefore rely on water impoundment particularly for agriculture. In the East there is either more consistent water or at least better groundwater storage to draw from. Hexagonal tessellation shapes all these patterns by averaging dam locations across equal-area tiles. This tends to suppress the western infrastructure clusters. If you made the grid finer is might make more cluster around the east coast but it would make the western tiles have more biased introduced and make them appear more empty.
+
+## Question 5
+
+### 5.1
+
+```{r}
+library(tidyr)
+# Spatial join dams to hex grid, summarize attributes per tile
+tile_attrs <- hex_grid_clip |>
+  st_join(dams) |>
+  st_drop_geometry() |>
+  group_by(id) |>
+  summarise(
+    n_dams             = sum(!is.na(dam_name)),
+    mean_year          = mean(year_completed, na.rm = TRUE),
+    mean_surface_acres = mean(surface_area_acres, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Join summaries back to geometry, preserve zero-dam tiles
+hex_attrs <- hex_grid_clip |>
+  left_join(tile_attrs, by = "id") |>
+  mutate(
+    n_dams             = replace_na(n_dams, 0),
+    mean_year          = mean_year,          # NA is correct for empty tiles
+    mean_surface_acres = mean_surface_acres
+  )
+```
+
+### 5.2
+
+```{r}
+install.packages("spdep")
+library(spdep)
+
+# Build queen contiguity neighbor list
+nb <- poly2nb(hex_attrs, queen = TRUE)
+
+# Row-standardized weights matrix (W)
+lw     <- nb2listw(nb, style = "W", zero.policy = TRUE)
+W_std  <- listw2mat(lw)
+```
+
+```{r}
+# ── Attribute vectors ──────────────────────────────────────────────────────
+count_vec <- hex_attrs$n_dams
+age_vec   <- hex_attrs$mean_year
+size_vec  <- hex_attrs$mean_surface_acres
+
+# ── NA imputation with global mean before matrix multiplication ────────────
+impute_mean <- function(x) { x[is.na(x)] <- mean(x, na.rm = TRUE); x }
+
+age_imp  <- impute_mean(age_vec)
+size_imp <- impute_mean(size_vec)
+
+# ── Spatial lag (W %*% attribute) ─────────────────────────────────────────
+lag_count <- as.vector(W_std %*% count_vec)
+lag_age   <- as.vector(W_std %*% age_imp)
+lag_size  <- as.vector(W_std %*% size_imp)
+
+# ── Correlate with spatial lag (only where real observations exist) ────────
+cor_count <- cor(count_vec,               lag_count,
+                 use = "complete.obs")
+cor_age   <- cor(age_vec[!is.na(age_vec)], lag_age[!is.na(age_vec)],
+                 use = "complete.obs")
+cor_size  <- cor(size_vec[!is.na(size_vec)], lag_size[!is.na(size_vec)],
+                 use = "complete.obs")
+
+# ── Summary table ──────────────────────────────────────────────────────────
+lag_summary <- data.frame(
+  Attribute    = c("Dam count", "Mean year completed", "Mean surface area (acres)"),
+  Correlation  = round(c(cor_count, cor_age, cor_size), 3),
+  Strength     = case_when(
+    abs(c(cor_count, cor_age, cor_size)) >= 0.5 ~ "Strong",
+    abs(c(cor_count, cor_age, cor_size)) >= 0.2 ~ "Moderate",
+    TRUE                                         ~ "Weak"
+  )
+)
+
+knitr::kable(
+  lag_summary,
+  col.names = c("Attribute", "Spatial Lag Correlation", "Strength"),
+  caption   = "Spatial lag correlations for dam attributes — Hexagonal Grid (n = 70)"
+)
+```
+
+### 5.3
+
+```{r}
+# Standardize dam count and its spatial lag
+z_count     <- scale(count_vec,  center = TRUE, scale = TRUE)[, 1]
+z_lag_count <- scale(lag_count,  center = TRUE, scale = TRUE)[, 1]
+
+# Assign Moran quadrants
+moran_df <- data.frame(
+  z     = z_count,
+  z_lag = z_lag_count
+) |>
+  mutate(quadrant = case_when(
+    z >= 0 & z_lag >= 0 ~ "HH",
+    z <  0 & z_lag <  0 ~ "LL",
+    z >= 0 & z_lag <  0 ~ "HL",
+    z <  0 & z_lag >= 0 ~ "LH"
+  ))
+
+# Quadrant counts
+quad_counts <- count(moran_df, quadrant)
+print(quad_counts)
+
+# Plot
+ggplot(moran_df, aes(x = z, y = z_lag, color = quadrant)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_smooth(aes(group = 1), method = "lm", se = FALSE,
+              color = "black", linewidth = 0.7) +
+  scale_color_manual(
+    values = c(HH = "#2166ac", LL = "#d1e5f0", HL = "#f4a582", LH = "#92c5de"),
+    name   = "Quadrant"
+  ) +
+  labs(
+    title    = "Moran Scatterplot — Dam Count",
+    x        = "Standardized dam count (z)",
+    y        = "Spatial lag of dam count (z)",
+    caption  = paste0(
+      "HH: ", quad_counts$n[quad_counts$quadrant == "HH"], "  ",
+      "LL: ", quad_counts$n[quad_counts$quadrant == "LL"], "  ",
+      "HL: ", quad_counts$n[quad_counts$quadrant == "HL"], "  ",
+      "LH: ", quad_counts$n[quad_counts$quadrant == "LH"]
+    )
+  ) +
+  theme_minimal()
+```
+
+### 5.4
+
+#### a. Spatial pattern
+
+The spatial lag correlations from 5.2 show a clear hierarchy across the three dam attributes. Dam count shows the strongest spatial autocorrelation, likely exceeding r=0.5 which qualifies as a strong cluster. The neighboring hex tiles tend to have similarly high or low dam counts across large regions of CONUS. This makes geographic sense since rivers are continuous so a tile with lots of dams will typically border other tiles on the same river system. The mean year completed (r=0.2-0.5) indicates that there was a real time period where dams were being built. Mean surface area shows the weakest correlation of the three, mainly because dam placement is typically constrained by geology which is site specific.
+
+#### b. Moran Scatterplot
+
+The Moran scatter plot for dam count should show a pronounced concentration of points in the upper-right (HH) and lower-left (LL) quadrants with the OLS regression line which has a clear positive slope. the slope itself is the global Morans I statistic. this diagonal clustering indicates high cluster surrounded by other sparse tiles rather than the points being scattered randomly across all four quadrants. The HH cluster corresponds to the eastern dam belt while the LL cluster corresponds to the more arid interior where dam infrastructure is sparse across large areas. If age and surface area scatterplots were overlaid both would show weaker diagonal clustering and more scatter around the regression line.
+
+#### c. Spatial Implications
+
+The correlation values and Moran scatterplot confirm that neighboring hex tiles are genuinely similar in dam count and relatively similar in dam age. Which means the independence assumption underlying the OLS regression is violated. The drivers of the spatial infrastructure are fundamentally hydrologic and policy based rather than coincidentally. They also respond to agricultural and municipal demand which are also clustered by climate zone. these correspond to question 4 maps where irrigation dams cluster in the arid west and hydroelectric dams in the PNW, each purpose pattern is spatially structured since the age and size correlate with purpose.
+
+## Question 6
+
+### 6.1
+
+```{r}
+# Hex grid already cropped from Q1 — recompute counts cleanly
+hex_cropped <- hex_grid_clip
+
+hex_dams <- point_in_polygon(dams, hex_cropped, "id")
+
+# Counties — add id if not present (from Q3 fix), recompute counts
+county_dams <- point_in_polygon(dams, counties, "id")
+```
+
+### 6.2
+
+```{r}
+# a. Binary adjacency matrix via st_touches
+W_hex <- st_touches(hex_dams, sparse = FALSE)
+
+# b. Remove self-neighbors
+diag(W_hex) <- 0
+
+# c. Row-standardize — divide each row by its row sum
+row_sums       <- rowSums(W_hex)
+row_sums[row_sums == 0] <- 1          # avoid divide-by-zero for isolated tiles
+W_hex_std      <- W_hex / row_sums
+
+# d. Compute spatial lag of dam count
+n_hex     <- hex_dams$n
+lag_hex   <- as.vector(W_hex_std %*% n_hex)
+
+# e. Standardize both to z-scores
+z_hex     <- scale(n_hex,   center = TRUE, scale = TRUE)[, 1]
+z_lag_hex <- scale(lag_hex, center = TRUE, scale = TRUE)[, 1]
+
+# Optional validation
+cat("Tiles with no neighbors:", sum(rowSums(W_hex) == 0), "\n")
+cat("Row sums range (post-standardize):",
+    round(range(rowSums(W_hex_std)), 3), "\n")
+```
+
+### 6.3
+
+```{r}
+# Assign quadrants
+hex_dams <- hex_dams |>
+  mutate(
+    z     = z_hex,
+    z_lag = z_lag_hex,
+    lisa  = case_when(
+      z >= 0 & z_lag >= 0 ~ "HH",
+      z <  0 & z_lag <  0 ~ "LL",
+      z >= 0 & z_lag <  0 ~ "HL",
+      z <  0 & z_lag >= 0 ~ "LH"
+    )
+  )
+
+# Quadrant counts
+hex_quad <- count(st_drop_geometry(hex_dams), lisa)
+print(hex_quad)
+
+# LISA color palette — consistent across both panels
+lisa_colors <- c(
+  HH = "#d7191c",   # red    — hotspot
+  LL = "#2c7bb6",   # blue   — coldspot
+  HL = "#fdae61",   # orange — high surrounded by low
+  LH = "#abd9e9"    # cyan   — low surrounded by high
+)
+
+# a) Moran scatterplot
+p_moran_hex <- ggplot(hex_dams, aes(x = z, y = z_lag, color = lisa)) +
+  geom_point(alpha = 0.6, size = 1.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_smooth(aes(group = 1), method = "lm", se = FALSE,
+              color = "black", linewidth = 0.7) +
+  scale_color_manual(values = lisa_colors, name = "Quadrant") +
+  labs(title = "Moran Scatterplot — Hex Grid",
+       x = "Standardized dam count (z)",
+       y = "Spatial lag (z)") +
+  theme_minimal()
+
+# b) LISA geographic map
+p_lisa_hex <- ggplot(hex_dams) +
+  geom_sf(aes(fill = lisa), color = NA) +
+  scale_fill_manual(values = lisa_colors, name = "LISA quadrant") +
+  theme_void() +
+  labs(
+    title   = "LISA Map — Hexagonal Grid",
+    caption = paste0(
+      "HH: ", hex_quad$n[hex_quad$lisa == "HH"], "  ",
+      "LL: ", hex_quad$n[hex_quad$lisa == "LL"], "  ",
+      "HL: ", hex_quad$n[hex_quad$lisa == "HL"], "  ",
+      "LH: ", hex_quad$n[hex_quad$lisa == "LH"]
+    )
+  )
+```
+
+### 6.4
+
+```{r}
+# ── County neighbor matrix ────────────────────────────────────────────────
+W_county <- st_touches(county_dams, sparse = FALSE)
+diag(W_county) <- 0
+
+row_sums_c              <- rowSums(W_county)
+row_sums_c[row_sums_c == 0] <- 1
+W_county_std            <- W_county / row_sums_c
+
+n_county     <- county_dams$n
+lag_county   <- as.vector(W_county_std %*% n_county)
+
+z_county     <- scale(n_county,   center = TRUE, scale = TRUE)[, 1]
+z_lag_county <- scale(lag_county, center = TRUE, scale = TRUE)[, 1]
+
+# Assign quadrants
+county_dams <- county_dams |>
+  mutate(
+    z     = z_county,
+    z_lag = z_lag_county,
+    lisa  = case_when(
+      z >= 0 & z_lag >= 0 ~ "HH",
+      z <  0 & z_lag <  0 ~ "LL",
+      z >= 0 & z_lag <  0 ~ "HL",
+      z <  0 & z_lag >= 0 ~ "LH"
+    )
+  )
+
+county_quad <- count(st_drop_geometry(county_dams), lisa)
+print(county_quad)
+
+# LISA map — counties
+p_lisa_county <- ggplot(county_dams) +
+  geom_sf(aes(fill = lisa), color = NA) +
+  scale_fill_manual(values = lisa_colors, name = "LISA quadrant") +
+  theme_void() +
+  labs(
+    title   = "LISA Map — Counties",
+    caption = paste0(
+      "HH: ", county_quad$n[county_quad$lisa == "HH"], "  ",
+      "LL: ", county_quad$n[county_quad$lisa == "LL"], "  ",
+      "HL: ", county_quad$n[county_quad$lisa == "HL"], "  ",
+      "LH: ", county_quad$n[county_quad$lisa == "LH"]
+    )
+  )
+
+# ── Side-by-side comparison ───────────────────────────────────────────────
+(p_lisa_hex / p_lisa_county) +
+  plot_annotation(
+    title   = "LISA Hotspot Comparison: Hexagonal Grid vs. Counties",
+    caption = "National Dam Inventory — USACE | EPSG:5070"
+  )
+```
+
+### 6.5
+
+#### a.
+
+The LISA maps reveal HH hotspots concentrated most strongly in the Ohio Valley, Tennessee and New England. These are regions where dam density in any given tile is reinforced by equally dense neighboring tiles. Tennessee stands out as the most spatial contiguous HH clusters in CONUS. A couple reasons is that the river systems in Tennessee has high gradient and high discharge making is prime for hydroelectric and flood storage across multi-state watersheds.. Also the investment from the 1930s to the 1960s meant that the dams were built as an interconnected operational system where the upstream has a real impact on the downstream for flood timing. LL coldspots are mostly in the Desert and the great plains where topography and/or low run off and low populations make impoundment not economical.
+
+#### b.
+
+Notable HL tiles which are th high dam count surrounded by low count neighbors appear in Colorado and Central California. This is where intense irrigation infrastructure creates more localized dam infrastructure that doesn't extend to surrounding areas (in the mountains). These highlight the agricultural lowlands that are abutted next to undeveloped mountainous regions. A large reservoir like Hoover Dam would also appear as a HL if it was next to super undeveloped wilderness. LH tiles which are sparse tiles surrounded by dense neighbors are more rare. These represent locations where dam construction may have been restricted by land status despite the hydrology or the area.
+
+#### c.
+
+The choice between hexagonal tiles and counties can produce different LISA maps. These differences are the most obvious at the edges as opposed to the actual hotspots and coldspots. The county tessellation generates more raw HH polygons just because los of countries provide more opportunity than the low hexagonal tiles. But they should be generally the same. The largest divergence is where the county boundaries cut through river corridors. A high density watershed that is split between two countries might show a much lower HL or LH as opposed the more accurate HH classification. the hexagonal accounts for this. This is the MAUP operating at the local scale. The administrative boundaries can introduce artifacts into the spatial process which is organized by hydrology rather than political boundaries. This is why the hexagonal LISA map is typically more reliable.
+
+#### d.
+
+The LISA output directly translates to the tiers management pririties across three categories. The HH hotspot regions (Tennessee, Ohio, New England) should be an area with much more multistate coordination efforts and emergency planning. If one dam were to collapse the downstream effects to each of these areas could be catastrophic. LL coldspot regions in the west represent much more simple management. Dams are isolated and far and few between and many are isolated. Comparing Q6 LISA results to Q4 purpose maps illustrate how the irrigation dam hotspots concentrate in the western US and the all-dam LISA hotspots are concentrated in the east. This means that there are fundamental differences in how the west needs to coordinate water management and how the east should.
