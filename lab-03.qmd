@@ -19,8 +19,12 @@ remotes::install_github("mikejohnson51/AOI")
 
 
 # Get CONUS counties and project to Albers Equal Area (EPSG:5070)
+
 counties <- AOI::aoi_get(state = "conus", county = "all") |>
-  st_transform(5070)
+  st_transform(5070) |>
+  mutate(id = 1:n())
+
+counties <- counties |> mutate(county_id = 1:n())
 ```
 
 ### 1.2
@@ -204,7 +208,6 @@ The five tessellations differ a lot in the feature count, mean tile area and the
 
 ```{r}
 library(readr)
-install.packages("janitor")
 library(janitor)
 
 nid_url  <- "https://nid.sec.usace.army.mil/api/nation/csv"
@@ -232,6 +235,7 @@ usa <- AOI::aoi_get(state = "conus") |>
   st_union() |>
   st_transform(5070)
 
+
 dams <- dams_raw |>
   filter(!is.na(latitude)) |>
   st_as_sf(coords = c("longitude", "latitude"), crs = 4326) |>
@@ -243,11 +247,14 @@ dams <- dams_raw |>
 
 ```{r}
 point_in_polygon <- function(points, polygons, id_col) {
-  polygons |>
+  
+  polygons_slim <- polygons |> select(all_of(id_col))
+  
+  polygons_slim |>
     st_join(points) |>
     st_drop_geometry() |>
     count(.data[[id_col]]) |>
-    left_join(polygons, by = id_col) |>
+    left_join(polygons_slim, by = id_col) |>
     st_as_sf()
 }
 ```
@@ -255,6 +262,9 @@ point_in_polygon <- function(points, polygons, id_col) {
 ### 3.3
 
 ```{r}
+cat("counties has id:", "id" %in% names(counties), "\n")
+cat("counties columns:", paste(names(counties), collapse = ", "), "\n")
+
 dams_counties    <- point_in_polygon(dams, counties,         "id")
 dams_voronoi     <- point_in_polygon(dams, voronoi_clip,     "id")
 dams_delaunay    <- point_in_polygon(dams, triangulate_clip, "id")
@@ -407,7 +417,6 @@ hex_attrs <- hex_grid_clip |>
 ### 5.2
 
 ```{r}
-install.packages("spdep")
 library(spdep)
 
 # Build queen contiguity neighbor list
