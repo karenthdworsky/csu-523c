@@ -1,0 +1,374 @@
+---
+title: "lab-04"
+format: html
+editor: visual
+---
+
+## Background/Set up
+
+```{r}
+library(rstac)    # STAC API
+library(terra)    # raster handling
+library(sf)       # vector data
+library(mapview)  # quick interactive maps
+library(AOI)      # geocoding (Mike Johnson's package)
+library(dplyr)
+```
+
+### Step 1
+
+```{r}
+palo <- AOI::geocode("Palo, Iowa", bbox = TRUE)
+mapview(palo)
+```
+
+### Step 2
+
+```{r}
+temporal <- "2016-09-24/2016-09-29"
+```
+
+### Step 3
+
+```{r}
+stac_query <- stac("https://planetarycomputer.microsoft.com/api/stac/v1") |>
+  stac_search(
+    collections = "landsat-c2-l2",
+    bbox        = sf::st_bbox(palo),
+    datetime    = temporal,
+    limit       = 10
+  ) |>
+  get_request() |>
+  items_sign(sign_fn = sign_planetary_computer())
+
+stac_query
+```
+
+```{r}
+stac_query <- stac_query |>
+  items_filter(properties$platform == "landsat-8")
+
+stac_query  # should now show only LC08_L2SP_025031_20160926_02_T1
+```
+
+```{r}
+bands <- c('coastal', 'blue', 'green', 'red', 'nir08', 'swir16')
+
+dir.create("data/landsat", recursive = TRUE, showWarnings = FALSE)
+
+assets_download(
+  items       = stac_query,
+  asset_names = bands,
+  output_dir  = "data/landsat",
+  overwrite   = TRUE
+)
+```
+
+### Step 4
+
+```{r}
+files <- list.files(
+  "data/landsat",
+  pattern    = "SR_B[1-6]\\.TIF$",
+  recursive  = TRUE,
+  full.names = TRUE
+) |> sort()
+
+files  # sanity check — should be six paths, B1 through B6
+
+r <- rast(files) |> setNames(bands)
+r
+```
+
+## Question 1.
+
+```{r}
+dim(r)  # rows, cols, layers
+crs(r, describe = TRUE)
+res(r)
+```
+
+The staked image has dimensions of 7801 rows x 7681 columns x 6 layers. The coordinate system is WGS 84/UTM zone 15N which sits in eastern Iowa. The cell size is 30m x 30m.
+
+### Step 5
+
+```{r}
+# Reproject AOI to raster CRS
+palo_utm <- st_transform(palo, crs(r))
+
+# buffer to capture the river corridor around Palo (~5 km)
+palo_buf <- st_buffer(palo_utm, 5000)
+
+# Crop the stack
+r_crop <- crop(r, vect(palo_buf))
+r_crop
+```
+
+```{r}
+#test if it worked
+plot(r_crop$red)
+plot(st_geometry(palo_utm), add = TRUE, border = "red", lwd = 2)
+```
+
+```{r}
+# a few test plots
+plotRGB(r_crop, r = 4, g = 3, b = 2, stretch = "lin",
+        main = "True color (4-3-2)")
+
+plotRGB(r_crop, r = 5, g = 4, b = 3, stretch = "lin",
+        main = "Color infrared (5-4-3)")
+
+plotRGB(r_crop, r = 6, g = 5, b = 4, stretch = "lin",
+        main = "False color urban (6-5-4)")
+```
+
+## Question 2.
+
+```{r}
+par(mfrow = c(2, 2))
+
+# 1. Natural color: R-G-B (4-3-2)
+plotRGB(r_crop, r = 4, g = 3, b = 2, stretch = "lin",
+        main = "Natural color (R-G-B)")
+
+# 2. Color infrared: NIR-R-G (5-4-3)
+plotRGB(r_crop, r = 5, g = 4, b = 3, stretch = "lin",
+        main = "Color infrared (NIR-R-G)")
+
+# 3. False color water focus: NIR-SWIR1-R (5-6-4)
+plotRGB(r_crop, r = 5, g = 6, b = 4, stretch = "lin",
+        main = "False color water (NIR-SWIR1-R)")
+
+# 4. Your choice — agriculture: SWIR1-NIR-B (6-5-2)
+plotRGB(r_crop, r = 6, g = 5, b = 2, stretch = "lin",
+        main = "Agriculture (SWIR1-NIR-B)")
+
+par(mfrow = c(1, 1))
+```
+
+```{r}
+par(mfrow = c(1, 2))
+plotRGB(r_crop, r = 5, g = 4, b = 3, stretch = "lin",
+        main = "Linear stretch")
+plotRGB(r_crop, r = 5, g = 4, b = 3, stretch = "hist",
+        main = "Histogram stretch")
+par(mfrow = c(1, 1))
+```
+
+The RGB image is the closest to our actual vision. The rivers are visible as brown sediment laden water. The contrast between water and the soils is hard to detect. And flood delineation is really hard to see.
+
+NIR-R-G image shows healthy vegetation with red colors because the plants reflect the NIR so strongly while absorbing water. The river channel stands out here against the red.
+
+NIR-SWIR1-R image is really good at isolating the water since the water appears as dark blue since SWIR and NIR absorbs water. Vegetation stands out and so do the city houses. The contrast makes it a lot easier to see the flood extent.
+
+SWIR1-NIR-B image is the agriculture one. I chose this one because of all the surrounding agriculture to Palo and the impact the ag is part of the story one might want to tell about the impacts of the flood. The SWIR band is sensitive to saturated soil so the submerged crops appear slightly darker.
+
+The stretch comparison shows the linear stretch that has re-scaled the pixel values to the display range which not only preserves the brightness relationship but also creates a more natural looking image. The histogram stretch redistributed the pixel values to produce a more uniform intensity and makes more subtle features stand out more. But also can accentuate the noise.
+
+## Question 3.
+
+### Step 1
+
+```{r}
+ndvi  <- (r_crop$nir08  - r_crop$red)    / (r_crop$nir08 + r_crop$red)
+ndwi  <- (r_crop$green  - r_crop$nir08)  / (r_crop$green + r_crop$nir08)
+mndwi <- (r_crop$green  - r_crop$swir16) / (r_crop$green + r_crop$swir16)
+wri   <- (r_crop$green  + r_crop$red)    / (r_crop$nir08 + r_crop$swir16)
+swi   <- 1 / sqrt(r_crop$blue - r_crop$swir16)
+
+indices <- c(ndvi, ndwi, mndwi, wri, swi) |>
+  setNames(c("NDVI", "NDWI", "MNDWI", "WRI", "SWI"))
+
+indices
+```
+
+```{r}
+plot(indices,
+     col = colorRampPalette(c("blue", "white", "red"))(256))
+```
+
+"Describe the 5 images. How are they similar and where do they deviate?"
+
+All five of the images show the same flood feature which is just the main river channel. However, for NIR and SWIR vegetation is strongly reflected which is the sharp contrast. But NDVI is a vegetation index so it isn't meant to actual detect water specifically.
+
+### Step 2
+
+```{r}
+flood_ndvi  <- app(ndvi,  fun = function(x) ifelse(x <  0, 1, 0))
+flood_ndwi  <- app(ndwi,  fun = function(x) ifelse(x >  0, 1, 0))
+flood_mndwi <- app(mndwi, fun = function(x) ifelse(x >  0, 1, 0))
+flood_wri   <- app(wri,   fun = function(x) ifelse(x >  1, 1, 0))
+flood_swi   <- app(swi,   fun = function(x) ifelse(x <  5, 1, 0))
+```
+
+```{r}
+flood_stack <- c(flood_ndvi, flood_ndwi, flood_mndwi, flood_wri, flood_swi) |>
+  setNames(c("NDVI", "NDWI", "MNDWI", "WRI", "SWI"))
+
+# Convert any NA / NaN to 0 (non-flood)
+flood_stack <- app(flood_stack, fun = function(x) ifelse(is.na(x), 0, x)) |>
+  setNames(c("NDVI", "NDWI", "MNDWI", "WRI", "SWI"))
+```
+
+```{r}
+plot(flood_stack, col = c("white", "blue"))
+```
+
+```{r}
+#CHECK
+global(flood_stack, fun = "sum", na.rm = TRUE)
+global(flood_stack, fun = "sum", na.rm = TRUE) * 900 / 1e6
+```
+
+### Step 3
+
+"Describe the differences and similarities between the different maps."
+
+All five maps identify the same core flooding features and the channel which is N/S. The obvious overbank flooding is around the town of Palo. They all show where the actual channel is. How they differ is in the completeness. Some produced a very thin main channel, others captures the full extent of the overbank flooding.
+
+## Question 4.
+
+### Step 1
+
+```{r}
+set.seed(555)
+```
+
+### Step 2
+
+```{r}
+v <- values(r_crop)
+dim(v)
+```
+
+```{r}
+v <- na.omit(v)
+dim(v)
+```
+
+"What do the dimensions of the extracted values tell you about how the data was extracted?"
+
+The values function returned a matrix with 196,880 rows and 6 columns which corresponds to the 6 bands. Each column has the bands reflectance values across the image. The number of rows equals the number of pixels in the cropped raster. This means that values flattened the 3D spatial structure into a 2D matrix. The spatial arrangement is now in k-means with one observation per row per column.
+
+### Step 3
+
+```{r}
+set.seed(555)
+
+k <- 12
+km <- kmeans(v, centers = k, iter.max = 100, nstart = 5)
+
+# The cluster assignments for each pixel
+head(km$cluster)
+length(km$cluster)  # should equal nrow(v) = 196880
+```
+
+### Step 4
+
+```{r}
+# Copy one band to use as a template (inherits extent, CRS, resolution)
+kmeans_raster <- r_crop$coastal
+
+# Overwrite with the cluster assignments
+values(kmeans_raster) <- km$cluster
+
+plot(kmeans_raster, col = rainbow(12), main = "k-means clusters (k = 12)")
+```
+
+```{r}
+run_kmeans <- function(v, r_template, k, seed = 123) {
+  set.seed(seed)
+  km <- kmeans(v, centers = k, iter.max = 100, nstart = 5)
+  out <- r_template$coastal
+  values(out) <- km$cluster
+  out
+}
+
+k3  <- run_kmeans(v, r_crop,  3)
+k6  <- run_kmeans(v, r_crop,  6)
+k12 <- run_kmeans(v, r_crop, 12)
+k20 <- run_kmeans(v, r_crop, 20)
+
+kmeans_compare <- c(k3, k6, k12, k20) |>
+  setNames(c("k=3", "k=6", "k=12", "k=20"))
+
+plot(kmeans_compare, col = rainbow(20))
+```
+
+```{r}
+set.seed(555)
+km12 <- kmeans(v, centers = 12, iter.max = 100, nstart = 5)
+
+# Inspect the full spectral signatures
+round(km12$centers)
+```
+
+```{r}
+# Sort clusters by combined NIR+SWIR - water is at the top
+round(km12$centers[order(km12$centers[, "nir08"] + km12$centers[, "swir16"]), ])
+
+water12 <- which.min(km12$centers[, "nir08"] + km12$centers[, "swir16"])
+water12
+```
+
+```{r}
+kmeans_raster12 <- r_crop$coastal
+values(kmeans_raster12) <- km12$cluster
+
+flood_km12 <- kmeans_raster12 == water12
+plot(flood_km12, col = c("white", "blue"),
+     main = paste0("k-means flood extent (k = 12, cluster ", water12, ")"))
+```
+
+### Step 5
+
+```{r}
+cross_tab <- table(
+  values(flood_stack$MNDWI),
+  values(kmeans_raster12)
+)
+
+cross_tab
+```
+
+```{r}
+flood_cluster <- which.max(cross_tab[2, ])
+flood_cluster
+```
+
+```{r}
+flood_kmeans <- app(kmeans_raster12,
+                    fun = function(x) ifelse(x == flood_cluster, 1, 0))
+```
+
+```{r}
+flood_stack_all <- c(flood_stack, flood_kmeans) |>
+  setNames(c("NDVI", "NDWI", "MNDWI", "WRI", "SWI", "kmeans"))
+
+plot(flood_stack_all, col = c("white", "blue"))
+```
+
+## Question 5.
+
+```{r}
+cell_area_km2 <- prod(res(flood_stack_all)) / 1e6  # 900 / 1e6 = 9e-4
+
+flood_areas <- global(flood_stack_all, fun = "sum", na.rm = TRUE) * cell_area_km2
+names(flood_areas) <- "flood_area_km2"
+flood_areas
+```
+
+```{r}
+agreement <- app(flood_stack_all, fun = sum)
+
+plot(agreement, col = blues9, main = "Flood agreement (0 = no methods, 6 = all methods)")
+```
+
+```{r}
+agreement_nz <- agreement
+agreement_nz[agreement_nz == 0] <- NA
+
+mapview(agreement_nz)
+```
+
+The reason the cell values arent even numbers is the cell values in mapview aren't anyways whole numbers even though agreement raster contains only integers from 0-6. The mapview doesn't display the 30 m ratser grid full resolution and instead re-projects and resamples it. When zoomed out the 30 m pixels get averaged and those aren't always whole numbers.
