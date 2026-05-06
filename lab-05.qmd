@@ -1,0 +1,779 @@
+---
+title: "Lab 5: Machine Learning in Hydrology with CAMELS"
+author: "Karenth Dworsky"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    theme: cosmo
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+editor: source
+---
+
+## Set up/Background
+
+```{r}
+#| label: setup
+#| message: false
+#| include: false
+
+library(tidyverse)
+library(tidymodels)
+library(powerjoin)
+library(glue)
+library(vip)
+library(baguette)
+library(sf)
+library(spatialsample)
+library(skimr)
+library(visdat)
+library(patchwork)
+library(scico)
+library(ape)
+library(ggrepel)
+library(ggthemes)   
+```
+
+This lab develops an end-to-end machine-learning pipeline to predict mean streamflow across 668 catchments in the CAMELS dataset. The pipeline progresses from exploratory data analysis and predictor screening, through recipe-based preprocessing and a workflow-set comparison of three model families, to a hyperparameter-tuned random forest evaluated under both random and spatial block cross-validation. The central diagnostic is the gap between the two CV schemes: a small gap indicates the model uses its predictors mechanistically rather than as geographic proxies, while a large gap exposes leakage through spatial autocorrelation. Variable importance is interpreted through this same geographic-proxy lens by cross-referencing permutation importance against per-predictor Moran's I.
+
+## Q1
+
+```{r}
+root <- "https://zenodo.org/records/15529996/files"
+
+# The documentation PDF
+download.file(
+  glue("{root}/camels_attributes_v2.0.pdf?download=1"),
+  "data/camels_attributes_v2.0.pdf",
+  mode = "wb"
+)
+
+# The six basin-attribute tables
+types        <- c("clim", "geol", "soil", "topo", "vege", "hydro")
+remote_files <- glue("{root}/camels_{types}.txt?download=1")
+local_files  <- glue("data/camels_{types}.txt")
+
+walk2(remote_files, local_files, download.file, quiet = TRUE, mode = "wb")
+
+# Read and merge
+camels <- map(local_files, read_delim, show_col_types = FALSE) |>
+  power_full_join(by = "gauge_id")
+
+glimpse(camels)
+```
+
+`zero_q_freq` is the fraction of daily streamflow observations equal to zero mm/day over the reference period. It is a signature of basin intermittency high values indicate ephemeral or intermittent systems typical of arid or heavily regulated catchments, while perennial humid basins approach zero. For a log-streamflow model like the one built in this lab, basins with non-trivial `zero_q_freq` are a known failure mode, since `log(0)` is undefined.
+
+## Q2
+
+```{r}
+#| label: q2-maps
+#| fig-width: 10
+#| fig-height: 8
+
+library(scico)
+library(patchwork)
+
+# Aridity map — lajolla palette (warm, dry-coded), log scale.
+# High aridity (dry) reads bright; low aridity (humid) reads dark.
+map_aridity <- ggplot(camels, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray70", linewidth = 0.3) +
+  geom_point(aes(color = aridity), size = 1.8, alpha = 0.85) +
+  scale_color_scico(
+    palette = "lajolla",
+    trans   = "log10",
+    name    = "Aridity\n(PET / P)",
+    breaks  = c(0.2, 0.5, 1, 2, 5)
+  ) +
+  coord_sf(xlim = c(-125, -67), ylim = c(25, 50)) +
+  labs(
+    title    = "Aridity across CAMELS basins",
+    subtitle = "PET / P — values > 1 indicate water-limited catchments",
+    x = NULL, y = NULL
+  ) +
+  ggthemes::theme_map() +
+  theme(
+    legend.position = "right",
+    plot.title      = element_text(face = "bold")
+  )
+
+# Precipitation map — davos palette (cool, water-coded), log scale, reversed
+# so wet basins read bright and dry basins read dark.
+map_pmean <- ggplot(camels, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray70", linewidth = 0.3) +
+  geom_point(aes(color = p_mean), size = 1.8, alpha = 0.85) +
+  scale_color_scico(
+    palette   = "davos",
+    trans     = "log10",
+    direction = -1,
+    name      = "Mean precip.\n(mm/day)",
+    breaks    = c(1, 2, 5, 10)
+  ) +
+  coord_sf(xlim = c(-125, -67), ylim = c(25, 50)) +
+  labs(
+    title    = "Mean daily precipitation across CAMELS basins",
+    subtitle = "Long-term mean of daily precipitation (mm/day, log scale)",
+    x = NULL, y = NULL
+  ) +
+  ggthemes::theme_map() +
+  theme(
+    legend.position = "right",
+    plot.title      = element_text(face = "bold")
+  )
+
+map_aridity / map_pmean +
+  plot_annotation(
+    title = "CAMELS basin climate context",
+    theme = theme(plot.title = element_text(size = 14, face = "bold"))
+  )
+
+```
+
+The two maps show CAMELS basin centroids colored by aridity (PET / P, top, on a log scale with values \> 1 indicating water-limited catchments) and mean daily precipitation (mm/day, bottom, also on a log scale). The patterns are spatially complementary: precipitation gradients run east–west along the Pacific orographic divide and roughly south–north along the Appalachian front, with the wettest basins concentrated in the Pacific Northwest, the southern Cascades, and the southeastern uplands. Aridity inverts that pattern, with the arid-basin tail dominated by interior-West sites in the Great Basin, Colorado Plateau, and southern Plains. Together these two variables span the dominant continental hydroclimate gradient and motivate their inclusion as primary predictors in the modeling pipeline below.
+
+## Q3
+
+```{r}
+#| label: model-prep
+
+set.seed(123)
+
+# Log-transform the outcome a priori (cleaner than doing it inside the recipe).
+# A handful of basins have q_mean = 0 (intermittent systems — the zero_q_freq
+# variable from Q1 quantifies this). log(0) = -Inf, so drop them now.
+camels <- camels |>
+  filter(q_mean > 0) |>
+  mutate(logQmean = log(q_mean))
+
+# 80/20 split
+camels_split <- initial_split(camels, prop = 0.8)
+camels_train <- training(camels_split)
+camels_test  <- testing(camels_split)
+
+# 10-fold CV on the training set for honest model comparison
+camels_cv <- vfold_cv(camels_train, v = 10)
+
+# Recipe: predict logQmean from aridity + p_mean, with the transforms the EDA
+# motivated (log predictors, aridity*p_mean interaction, drop NAs)
+rec <- recipe(logQmean ~ aridity + p_mean, data = camels_train) |>
+  step_log(all_predictors()) |>
+  step_interact(terms = ~ aridity:p_mean) |>
+  step_naomit(all_predictors(), all_outcomes())
+```
+
+```{r}
+#| label: starter-models
+
+lm_model <- linear_reg() |>
+  set_engine("lm") |>
+  set_mode("regression")
+
+rf_model <- rand_forest() |>
+  set_engine("ranger", importance = "impurity") |>
+  set_mode("regression")
+```
+
+```{r}
+#| label: q3-additional-models
+
+xgb_model <- boost_tree() |>
+  set_engine("xgboost") |>
+  set_mode("regression")
+
+nn_model <- bag_mlp() |>
+  set_engine("nnet") |>
+  set_mode("regression")
+```
+
+```{r}
+#| label: q3-workflow-set
+#| message: false
+
+wf_set <- workflow_set(
+  preproc = list(rec = rec),
+  models  = list(
+    lm  = lm_model,
+    rf  = rf_model,
+    xgb = xgb_model,
+    nn  = nn_model
+  )
+) |>
+  workflow_map(
+    "fit_resamples",
+    resamples = camels_cv,
+    control   = control_resamples(save_pred = TRUE),
+    verbose   = TRUE
+  )
+
+autoplot(wf_set)
+
+rank_results(wf_set, rank_metric = "rsq", select_best = TRUE)
+```
+
+Across 10-fold random CV, all four models cluster tightly on the minimal two-predictor recipe: the bagged neural net edges out random forest (RMSE 0.55 vs 0.56) with the linear baseline a hair behind, and xgboost trails (RMSE 0.61, R² 0.73). Per-fold standard errors overlap heavily across all four, so the rankings are not statistically distinguishable on this minimal recipe, a useful signal that with only aridity, p_mean, and their interaction, there is little non-linear structure for the tree-based models to exploit. I would carry random forest forward into Q4: it is effectively tied for best here, exposes a clean tuning surface (mtry, min_n), gives interpretable permutation-based variable importance for the geographic-proxy discussion the lab requires, and will benefit more than any of the others as the recipe expands from two predictors to eight.
+
+## Q4
+
+### 4a-Data Prep
+
+```{r}
+#| label: q4a-setup
+#| message: false
+
+library(skimr)
+library(visdat)
+library(sf)
+library(spatialsample)
+library(ape)   # for Moran.I
+
+set.seed(456)  # separate seed for the Q4 pipeline
+
+# Re-read the raw camels data so we're not carrying baggage from Q1-Q3.
+# (If you've already done filter(q_mean > 0) and added logQmean, this is fine
+# to skip — but starting clean here makes Q4 self-contained for grading.)
+camels_q4 <- map(local_files, read_delim, show_col_types = FALSE) |>
+  power_full_join(by = "gauge_id") |>
+  filter(q_mean > 0) |>
+  mutate(logQmean = log(q_mean))
+```
+
+```{r}
+#| label: q4a-skim
+
+# Full skim of the working data
+skim(camels_q4)
+```
+
+```{r}
+#| label: q4a-vis-dat
+#| fig-height: 6
+
+# Missingness map across all columns
+vis_dat(camels_q4) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 7))
+
+# Just the missingness pattern
+vis_miss(camels_q4, sort_miss = TRUE)
+```
+
+The CAMELS basin-attribute table contains 668 records across roughly 60 columns after dropping the handful of basins with q_mean = 0. Missingness is minimal and concentrated in four variables: geol_2nd_class (138 missing basins where a single geology class dominates and no secondary class is reported), root_depth_50 and root_depth_99 (24 each, perfectly co-missing across the same 24 basins), and geol_porostiy (3). The remaining \~95% of columns are complete, so the recipe will lean on step_naomit() for predictors with sparse missingness and avoid the secondary-geology column entirely. Right-skew in precipitation, area, and streamflow magnitudes motivates the logQmean outcome transform applied a priori, plus step_log() on selected positive-skewed predictors and step_normalize() for the linear and bagged-MLP engines, which are gradient- or distance-sensitive.
+
+```{r}
+#| label: q4a-distributions
+#| fig-height: 6
+#| fig-width: 10
+
+library(patchwork)
+
+# Outcome: untransformed and log-transformed
+p1 <- ggplot(camels_q4, aes(x = q_mean)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+  labs(title = "q_mean (mm/day)", x = NULL, y = "Count") +
+  theme_minimal()
+
+p2 <- ggplot(camels_q4, aes(x = logQmean)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+  labs(title = "log(q_mean) — modeling target", x = NULL, y = "Count") +
+  theme_minimal()
+
+# A few candidate predictors spanning climate, topography, soil, vegetation
+p3 <- ggplot(camels_q4, aes(x = p_mean)) +
+  geom_histogram(bins = 40, fill = "darkorange", color = "white") +
+  labs(title = "p_mean (mm/day)", x = NULL, y = NULL) +
+  theme_minimal()
+
+p4 <- ggplot(camels_q4, aes(x = aridity)) +
+  geom_histogram(bins = 40, fill = "darkorange", color = "white") +
+  scale_x_log10() +
+  labs(title = "aridity (log scale)", x = NULL, y = NULL) +
+  theme_minimal()
+
+p5 <- ggplot(camels_q4, aes(x = elev_mean)) +
+  geom_histogram(bins = 40, fill = "forestgreen", color = "white") +
+  labs(title = "elev_mean (m)", x = NULL, y = NULL) +
+  theme_minimal()
+
+p6 <- ggplot(camels_q4, aes(x = frac_snow)) +
+  geom_histogram(bins = 40, fill = "forestgreen", color = "white") +
+  labs(title = "frac_snow (0–1)", x = NULL, y = NULL) +
+  theme_minimal()
+
+(p1 | p2) / (p3 | p4) / (p5 | p6) +
+  plot_annotation(
+    title = "Outcome and candidate predictor distributions",
+    theme = theme(plot.title = element_text(face = "bold"))
+  )
+```
+
+The outcome q_mean is heavily right-skewed (mode \~1 mm/day, tail to \~10), and the log transform produces a roughly symmetric logQmean with a slight left-skew bump from low-flow basins, confirming the a priori transform was warranted. Among candidate predictors, p_mean and aridity are right-skewed but strictly positive (clean targets for step_log()); elev_mean is similarly right-skewed; frac_snow is bounded on \[0, 1\] and zero-inflated, with \~15% of basins receiving essentially no snow, this rules out step_log() for that variable and motivates either leaving it untransformed or applying step_YeoJohnson(). Land-cover and soil fraction predictors are similarly bounded and will not be log-transformed.
+
+```{r}
+#| label: q4a-morans
+#| message: false
+
+library(ape)
+
+# Build a distance-based weights matrix from basin centroids
+# (inverse distance, with self-weights zeroed out)
+coords     <- camels_q4 |> select(gauge_lon, gauge_lat) |> as.matrix()
+dist_mat   <- as.matrix(dist(coords))
+weights    <- 1 / dist_mat
+diag(weights) <- 0
+
+# Pick the candidate predictors you're considering for the recipe.
+# Add or trim this list based on what you actually want to model with.
+candidate_vars <- c(
+  "p_mean", "aridity", "pet_mean", "p_seasonality", "frac_snow",
+  "high_prec_freq", "low_prec_freq",
+  "elev_mean", "slope_mean", "area_gages2",
+  "frac_forest", "lai_max", "gvf_max",
+  "soil_depth_pelletier", "soil_porosity", "max_water_content",
+  "sand_frac", "silt_frac", "clay_frac",
+  "geol_permeability", "geol_porostiy"
+)
+
+# Compute Moran's I for each, dropping NAs row-wise per variable
+morans_results <- map_dfr(candidate_vars, function(v) {
+  vals <- camels_q4[[v]]
+  keep <- !is.na(vals)
+  if (sum(keep) < 10) return(NULL)
+  
+  w_sub <- weights[keep, keep]
+  mi <- ape::Moran.I(vals[keep], w_sub)
+  
+  tibble(
+    variable = v,
+    morans_I = mi$observed,
+    expected = mi$expected,
+    p_value  = mi$p.value
+  )
+}) |>
+  arrange(desc(morans_I))
+
+morans_results
+```
+
+All ten candidate predictors examined showed statistically significant positive spatial autocorrelation (Moran's I = 0.35–0.49, p \< 0.001 for all). The strongest spatial structure is in p_seasonality (I = 0.49), slope_mean (0.44), p_mean (0.43), and elev_mean (0.42), variables governed by continental climate regime and major topographic structure. Slightly weaker but still substantial structure appears in frac_snow and aridity (\~0.35), which retain meaningful within-region variability driven by local elevation. No examined predictor is spatially neutral, which means a model fit on these features cannot fully escape geographic confounding, random CV will likely overestimate generalization, and the gap between random and spatial CV in Q4d will be a direct test of how much the model relies on transferable physical signal versus geographic proximity.
+
+```{r}
+#| label: q4a-split
+
+set.seed(456)
+
+# 75/25 split, stratified on the (log-transformed) outcome to ensure
+# both train and test span the full streamflow range
+camels_split <- initial_split(camels_q4, prop = 0.75, strata = logQmean)
+
+camels_train <- training(camels_split)
+camels_test  <- testing(camels_split)
+
+# Sanity check: distributions should look similar
+nrow(camels_train); nrow(camels_test)
+
+bind_rows(
+  camels_train |> mutate(set = "train"),
+  camels_test  |> mutate(set = "test")
+) |>
+  ggplot(aes(x = logQmean, fill = set)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c(train = "steelblue", test = "darkorange")) +
+  labs(title = "Outcome distribution: train vs test", x = "logQmean", y = "Density") +
+  theme_minimal()
+```
+
+The 75/25 split is stratified on logQmean itself: tidymodels bins the outcome into quartiles and samples within each, ensuring both train (n = 501) and test (n = 167) span the full streamflow distribution. Stratification matters here because logQmean retains some skew even after the log transform — without stratification a random split could over- or under-represent the dry-basin tail, where prediction is hardest. Stratifying on the outcome rather than on a predictor (e.g., aridity) avoids any circular dependence between the stratification variable and the modeling features, and the post-split density plot confirms train and test cover overlapping ranges with no apparent bias.
+
+###4b-Recipe with Justification
+
+```{r}
+#| label: q4b-recipe
+
+camels_recipe <- recipe(
+  logQmean ~ p_mean + aridity + p_seasonality + frac_snow +
+             elev_mean + slope_mean + area_gages2 +
+             max_water_content,
+  data = camels_train
+) |>
+  # Drop any rows with missing predictors before transforms run
+  step_naomit(all_predictors(), all_outcomes()) |>
+  
+  # Log-transform the strictly-positive, right-skewed predictors flagged in EDA.
+  # frac_snow stays out (zero-inflated, bounded); p_seasonality stays out
+  # (can be negative); max_water_content stays out (bounded).
+  step_log(p_mean, aridity, elev_mean, slope_mean, area_gages2) |>
+  
+  # Yeo-Johnson handles the remaining right-skewed variables that contain
+  # zeros or are bounded — frac_snow especially benefits.
+  step_YeoJohnson(frac_snow, max_water_content, p_seasonality) |>
+  
+  # Center and scale all numeric predictors.
+  # Tree-based models don't need this, but linear/NN models do, and it
+  # doesn't hurt the trees — keeps the workflow set apples-to-apples.
+  step_normalize(all_numeric_predictors()) |>
+  
+  # Drop near-zero-variance predictors that survive transformation
+  step_zv(all_predictors())
+```
+
+```{r}
+camels_recipe |>
+  prep() |>
+  bake(new_data = NULL) |>
+  glimpse()
+```
+
+The recipe predicts logQmean from eight CAMELS attributes spanning the four physical-process domains documented in Addor et al. (2017): climate forcing (p_mean, aridity, p_seasonality, frac_snow), topographic structure (elev_mean, slope_mean, area_gages2), and subsurface storage capacity (max_water_content). This selection captures the dominant first-order controls on mean streamflow — water input, energy demand, seasonality of forcing, snow regime, drainage scale, and soil storage, while avoiding the redundancy of including correlated quantities like pet_mean alongside aridity (which is by construction pet_mean / p_mean). Five of the predictors are strictly positive and right-skewed, so they receive step_log(); frac_snow, max_water_content, and p_seasonality are bounded or contain zeros and instead receive step_YeoJohnson(), which generalizes the log to non-positive supports. All numeric predictors are then centered and scaled with step_normalize(), strictly necessary for the linear engine and harmless for the tree-based models, which keeps the workflow-set comparison fair. step_zv() provides a final guard against any near-constant predictors that could break model fits, and step_naomit() drops the 24 basins with missing root-depth values upstream of the transforms. The Moran's I diagnostic in Q4a flagged that every one of these predictors carries strong spatial structure (I = 0.35–0.49), foreshadowing the random-vs-spatial CV gap that Q4d will measure.
+
+### 4c-Define the models
+
+```{r}
+#| label: q4c-models
+
+# 1. Random forest with defaults (will be re-specified with tune() in Q4e)
+rf_model <- rand_forest(trees = 500) |>
+  set_engine("ranger", importance = "permutation") |>
+  set_mode("regression")
+
+# 2. Boosted trees (xgboost) with defaults
+xgb_model <- boost_tree(trees = 500) |>
+  set_engine("xgboost") |>
+  set_mode("regression")
+
+# 3. Linear regression baseline
+lm_model <- linear_reg() |>
+  set_engine("lm") |>
+  set_mode("regression")
+```
+
+### 4d-Workflow set and CV spatial comparison
+```{r}
+#| label: q4d-cv-setup
+#| message: false
+
+# Random 10-fold CV — same as Q3
+set.seed(456)
+folds_random <- vfold_cv(camels_train, v = 10, strata = logQmean)
+
+# For spatial CV, the training data needs to be an sf object with point geometry
+camels_train_sf <- camels_train |>
+  st_as_sf(coords = c("gauge_lon", "gauge_lat"), crs = 4326, remove = FALSE)
+
+# Spatial block CV — partitions space into blocks, assigns each block to one fold.
+# This forces folds to be geographically separated, so the model can't lean on
+# nearby-basin similarity to score well in CV.
+set.seed(456)
+folds_spatial <- spatial_block_cv(camels_train_sf, v = 10)
+
+# Visualize the spatial folds to confirm the blocking looks reasonable
+autoplot(folds_spatial)
+```
+
+
+
+```{r}
+#| label: q4d-workflow-set
+
+wf_set <- workflow_set(
+  preproc = list(rec = camels_recipe),
+  models  = list(
+    lm  = lm_model,
+    rf  = rf_model,
+    xgb = xgb_model
+  )
+)
+
+wf_set
+```
+
+```{r}
+#| label: q4d-fit-random
+#| message: false
+
+set.seed(456)
+
+results_random <- wf_set |>
+  workflow_map(
+    "fit_resamples",
+    resamples = folds_random,
+    control   = control_resamples(save_pred = TRUE, save_workflow = TRUE),
+    verbose   = TRUE
+  )
+```
+
+```{r}
+#| label: q4d-fit-spatial
+#| message: false
+
+set.seed(456)
+
+results_spatial <- wf_set |>
+  workflow_map(
+    "fit_resamples",
+    resamples = folds_spatial,
+    control   = control_resamples(save_pred = TRUE, save_workflow = TRUE),
+    verbose   = TRUE
+  )
+```
+
+
+```{r}
+#| label: q4d-compare
+#| fig-width: 10
+#| fig-height: 5
+
+# Side-by-side comparison
+p_random <- autoplot(results_random) +
+  labs(title = "Random 10-fold CV") +
+  theme_minimal()
+
+p_spatial <- autoplot(results_spatial) +
+  labs(title = "Spatial block CV") +
+  theme_minimal()
+
+library(patchwork)
+p_random + p_spatial
+
+# Numeric rankings
+rank_random <- rank_results(results_random, rank_metric = "rsq", select_best = TRUE) |>
+  mutate(cv_scheme = "random")
+
+rank_spatial <- rank_results(results_spatial, rank_metric = "rsq", select_best = TRUE) |>
+  mutate(cv_scheme = "spatial")
+
+bind_rows(rank_random, rank_spatial) |>
+  select(cv_scheme, wflow_id, .metric, mean, std_err, rank) |>
+  arrange(.metric, cv_scheme, rank)
+```
+
+```{r}
+#| label: q4d-gap-plot
+#| fig-height: 4
+
+bind_rows(
+  collect_metrics(results_random)  |> mutate(cv_scheme = "random"),
+  collect_metrics(results_spatial) |> mutate(cv_scheme = "spatial")
+) |>
+  filter(.metric == "rsq") |>
+  mutate(model = str_remove(wflow_id, "rec_")) |>
+  ggplot(aes(x = model, y = mean, color = cv_scheme)) +
+  geom_pointrange(
+    aes(ymin = mean - std_err, ymax = mean + std_err),
+    position = position_dodge(width = 0.4),
+    size = 0.8
+  ) +
+  scale_color_manual(values = c(random = "steelblue", spatial = "darkorange")) +
+  labs(
+    title    = "The honest gap: random vs. spatial CV",
+    subtitle = "Spatial CV reveals how much each model leans on geographic proximity",
+    x = NULL,
+    y = expression(R^2),
+    color = "CV scheme"
+  ) +
+  theme_minimal()
+```
+
+Random forest — bagged decision-tree ensemble that captures non-linear interactions and predictor importance natively, robust to predictor scale and the presence of correlated features, and reliably the strongest baseline for tabular regression problems of this size and shape.
+
+Boosted trees (xgboost) — sequential gradient-boosting ensemble that often outperforms random forest when there is exploitable non-linear structure, exposes the richest tuning surface (depth, learning rate, regularization) of any tree method, and lets us stress-test whether the random forest's accuracy is a ceiling or a default.
+
+Linear regression — parametric baseline that captures only the linear effects of standardized predictors; it provides a sanity-check anchor for the workflow set (a non-linear model that cannot beat linear is doing something wrong) and a fully transparent reference for interpreting the more complex models.
+
+
+```{r}
+#| label: q4d-rank-table
+
+rank_random  <- rank_results(results_random,  rank_metric = "rsq", select_best = TRUE) |>
+  mutate(cv_scheme = "random")
+rank_spatial <- rank_results(results_spatial, rank_metric = "rsq", select_best = TRUE) |>
+  mutate(cv_scheme = "spatial")
+
+bind_rows(rank_random, rank_spatial) |>
+  select(cv_scheme, wflow_id, .metric, mean, std_err, rank) |>
+  arrange(.metric, cv_scheme, rank)
+```
+
+Both CV schemes ran 10 folds against the eight-predictor recipe. Under random CV, the random forest and xgboost models tied at the top with R² = 0.93 (RMSE 0.32 and 0.31 respectively), with the linear baseline trailing at R² = 0.87. Spatial block CV produced consistently lower performance, random forest dropped to R² = 0.90, xgboost to R² = 0.88, and the linear model held nearly flat at R² = 0.86, for honest gaps of 0.033, 0.052, and 0.016 R² units respectively. The narrow gap for random forest is the headline finding: it sits at the low end of the 0.05–0.10 drop the lab flagged as expected, indicating the climate, topographic, and storage predictors are carrying real transferable physical signal rather than acting as geographic proxies. The slightly larger xgboost gap suggests its sequential boosting captured some location-specific structure that did not transfer across spatial blocks, while random forest's tree-averaging damped that out. Per-fold standard errors roughly doubled under spatial CV (from 0.004–0.020 to 0.016–0.044), reflecting that some spatial blocks, likely the snow-dominated Cascades/Rockies and arid Southwest, are systematically harder than the training-set average; the mean is honest, but the spread tells you the model is not equally confident everywhere. I treat the spatial CV estimate as the generalization metric of record: random CV is inflated by the strong spatial autocorrelation Q4a documented (Moran's I = 0.35–0.49 across all candidate predictors), and any deployed prediction in a new region would face the spatial regime, not the random one. Random forest is the model carried into Q4e for tuning, it won both schemes, has the smallest random-vs-spatial gap, and supports clean variable-importance interpretation for Q4f's geographic-proxy discussion.
+
+### 4e-Tuning
+
+```{r}
+#| label: q4e-rf-spec-tune
+
+rf_tune_spec <- rand_forest(
+  mtry  = tune(),
+  min_n = tune(),
+  trees = 500
+) |>
+  set_engine("ranger", importance = "permutation") |>
+  set_mode("regression")
+```
+
+```{r}
+#| label: q4e-grid
+
+rf_workflow <- workflow() |>
+  add_recipe(camels_recipe) |>
+  add_model(rf_tune_spec)
+
+# Use the workflow to extract sensible parameter ranges, then build a
+# space-filling Latin hypercube grid. mtry's upper bound has to be set
+# explicitly because it depends on the number of predictors (8 here).
+rf_params <- extract_parameter_set_dials(rf_workflow) |>
+  update(mtry = mtry(range = c(1L, 8L)))
+
+rf_grid <- grid_space_filling(rf_params, size = 25)
+
+rf_grid
+```
+
+```{r}
+#| label: q4e-tune
+#| message: false
+
+set.seed(456)
+
+rf_tune_results <- tune_grid(
+  rf_workflow,
+  resamples = folds_spatial,
+  grid      = rf_grid,
+  control   = control_grid(save_pred = TRUE, save_workflow = TRUE),
+  metrics   = metric_set(rmse, rsq, mae)
+)
+```
+
+```{r}
+#| label: q4e-autoplot
+#| fig-width: 9
+#| fig-height: 4
+
+autoplot(rf_tune_results)
+```
+
+```{r}
+#| label: q4e-best
+
+show_best(rf_tune_results, metric = "rsq", n = 5)
+
+best_rf_params <- select_best(rf_tune_results, metric = "rsq")
+best_rf_params
+```
+
+```{r}
+#| label: q4e-finalize
+
+best_rf_params <- select_best(rf_tune_results, metric = "rsq")
+best_rf_params
+
+# Finalize the workflow with the chosen hyperparameters
+final_rf_workflow <- finalize_workflow(rf_workflow, best_rf_params)
+final_rf_workflow
+```
+
+Tuned mtry and min_n over a 25-point Latin hypercube grid against 10-fold spatial block CV; trees was held at 500 (a budget knob, not a sensitivity knob). Latin hypercube was chosen over a regular grid because it covers the 2D hyperparameter space more uniformly for the same fit budget. The best combination was mtry = 3, min_n = 3 (spatial CV R² = 0.902, RMSE = 0.32), with the top four candidates within 0.002 R² of each other, well inside the per-fold standard error of \~0.016, indicating the result is a plateau rather than a sharp optimum. The tuning landscape shows that mtry was the dominant hyperparameter: performance was clearly worst at mtry = 1 and roughly flat from mtry = 3 onward, while min_n had a much weaker effect with only a slight preference for smaller terminal nodes (3–11). This pattern matches the random-forest literature: mtry controls the bias-variance tradeoff between tree decorrelation and individual tree strength, and once enough predictors are sampled per split (here, \~⅜ of 8) the model's accuracy is largely insensitive to further adjustment. Tuning gained \~0.004 R² over the default specification, a real but modest improvement, consistent with random forest being a strong default-performer.
+
+### 4f-VIP interpretation
+
+```{r}
+#| label: q4f-vip
+#| fig-height: 4
+
+# Fit the tuned workflow once on the full training set
+rf_final_fit <- fit(final_rf_workflow, data = camels_train)
+
+# Extract the parsnip model object and pass to vip
+rf_final_fit |>
+  extract_fit_parsnip() |>
+  vip::vip(
+    num_features = 8,
+    aesthetics   = list(fill = "steelblue", alpha = 0.8)
+  ) +
+  labs(
+    title    = "Random forest variable importance",
+    subtitle = "Permutation importance — drop in R² when each predictor is shuffled"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+#| label: q4f-vip-vs-morans
+
+# Pull the VIP values out as a tibble
+vip_data <- rf_final_fit |>
+  extract_fit_parsnip() |>
+  vip::vi() |>
+  rename(predictor = Variable, importance = Importance)
+
+# Join with your Moran's I results from Q4a
+proxy_df <- vip_data |>
+  inner_join(morans_results, by = c("predictor" = "variable"))
+
+ggplot(proxy_df, aes(x = morans_I, y = importance, label = predictor)) +
+  geom_point(size = 3, color = "steelblue") +
+  ggrepel::geom_text_repel(size = 3.5, max.overlaps = 20) +
+  labs(
+    title    = "Predictor importance vs. spatial autocorrelation",
+    subtitle = "Top-right = important AND geographic — candidates for proxy interpretation",
+    x        = "Moran's I (spatial autocorrelation)",
+    y        = "Permutation importance"
+  ) +
+  theme_minimal()
+```
+
+The random forest is dominated by two predictors: aridity (permutation importance 0.79) and p_mean (0.75) together account for nearly all of the explainable variance, with the remaining six predictors contributing 10× less individually. This is a physically satisfying result, mean streamflow is fundamentally water in (p_mean) modulated by atmospheric demand (aridity), and the random forest converged on this same Budyko-style decomposition without being told to. The middle tier (p_seasonality, slope_mean, frac_snow, elev_mean, each at importance 0.09–0.16) plays a fine-tuning role; area_gages2 and max_water_content are essentially inert in this model, suggesting the recipe could be pruned without meaningful loss.
+
+Cross-referencing against the Moran's I diagnostic from Q4a sharpens the geographic-proxy interpretation. The most spatially-structured predictors in the candidate set, p_seasonality (I = 0.49), slope_mean (I = 0.44), elev_mean (I = 0.42), frac_snow (I = 0.36) — are the predictors the random forest *under-weights*, sitting in the bottom-right quadrant of the importance-vs-autocorrelation scatter. The dominant predictor aridity (I = 0.35) is in fact the *least* spatially-structured of the climate variables, because it carries genuine within-region variability driven by local elevation and energy balance rather than continental position. p_mean (I = 0.43) is both important and geographic, but precipitation is the first-order forcing of streamflow regardless of where on the continent it falls, so its importance reflects mechanism, not proxy use. The fact that the importance ranking does not mirror the Moran's I ranking is the cleanest possible evidence that the model is using these features mechanistically rather than as a disguised latitude–longitude lookup, and is fully consistent with the small 0.033 R² gap between random and spatial CV reported in Q4d.
+
+### 4g-Evaluation and plot
+
+```{r}
+#| label: q4g-last-fit
+
+set.seed(456)
+
+final_results <- last_fit(
+  final_rf_workflow,
+  split   = camels_split,
+  metrics = metric_set(rmse, rsq, mae)
+)
+
+# Test-set metrics (one number per metric, no folds)
+collect_metrics(final_results)
+
+# Test-set predictions
+final_preds <- collect_predictions(final_results)
+final_preds
+```
+
+```{r}
+#| label: q4g-test-plot
+#| fig-width: 7
+#| fig-height: 6
+
+# Join predictions back to the test set so we can color by aridity
+final_preds_geo <- final_preds |>
+  bind_cols(camels_test |> select(aridity, gauge_lat, gauge_lon))
+
+ggplot(final_preds_geo, aes(x = logQmean, y = .pred, color = aridity)) +
+  geom_abline(slope = 1, intercept = 0, color = "gray40", linetype = 2) +
+  geom_point(size = 2, alpha = 0.85) +
+  scale_color_scico(palette = "lajolla", trans = "log10",
+                    name = "Aridity\n(PET / P)") +
+  coord_equal() +
+  labs(
+    title    = "Random forest: observed vs. predicted log mean streamflow",
+    subtitle = paste0(
+      "Test set (n = ", nrow(final_preds_geo), "), 1:1 line dashed"
+    ),
+    x = "Observed log(Q_mean)",
+    y = "Predicted log(Q_mean)"
+  ) +
+  theme_minimal()
+```
+
+The finalized random forest (mtry = 3, min_n = 3, 500 trees, eight predictors) achieved test-set R² = 0.899, RMSE = 0.389, and MAE = 0.234 on the 167 held-out basins. The R² is essentially identical to the spatial CV estimate of 0.902 from Q4e, which is the ideal outcome, it confirms that spatial block CV produced an honest and unbiased generalization estimate, and that the random forest is using its predictors mechanistically rather than memorizing geographic structure. RMSE rose modestly from the CV value of 0.32 to the test value of 0.39, and the MAE/RMSE ratio of 0.60 indicates heavy-tailed residuals, most basins are predicted very accurately, with a small subset of large errors driving most of the RMSE. The observed-vs-predicted plot makes the source of those errors visible: predictions cluster tightly along the 1:1 line for humid basins (low aridity, dark colors, upper-right) but show substantial scatter and a slight wet bias in the arid tail (yellow colors, lower-left), where streamflow is a small residual of two large fluxes (P − ET) and noise in either input amplifies into large fractional errors in Q. Natural next steps would be either expanding the recipe to include geology and land-cover predictors that capture subsurface storage and ET partitioning in dry basins, or stratifying the modeling by climate regime so that arid-basin physics doesn't have to share parameters with humid-basin physics, both of which would specifically target the heavy-tailed residual structure visible here.The finalized random forest achieves test-set R² = 0.899 with RMSE = 0.389, essentially indistinguishable from its spatial CV estimate (R² = 0.902). The random-vs-spatial CV gap of 0.033 R² and the fact that the model leans hardest on `aridity` the *least* spatially-structured predictor in the candidate set together provide strong evidence that the model captures genuine first-order hydrologic mechanism rather than disguised geography. The dominant residual structure is in the arid tail, where streamflow is a small residual of two large fluxes and prediction inherently noisy. A natural extension would be regime-stratified modeling, fitting separate humid and arid models with different predictor sets, since the present pipeline implicitly assumes a single set of parameters governs streamflow generation across the full continental gradient.
