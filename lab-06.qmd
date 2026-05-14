@@ -1,0 +1,320 @@
+---
+title: "Lab 6"
+format: html
+editor: visual
+---
+## Setup
+```{r}
+
+library(tidyverse)
+library(plotly)
+library(dataRetrieval)
+library(climateR)
+library(terra)
+library(exactextractr)
+library(tidymodels)
+library(tsibble)
+library(feasts)
+library(modeltime)
+library(timetk)
+library(tseries)   # for stationarity tests
+```
+
+```{r}
+
+
+#| cache: true
+#| message: false
+#| warning: false
+gauges <- tribble(
+  ~site_no,     ~name,                            ~state,
+  "06752260",   "Poudre at Mouth",                  "CO"
+)
+
+poudre_flow <- readNWISdv(
+  siteNumber = "06752260",
+  parameterCd = "00060",
+  startDate   = "2013-01-01",
+  endDate     = "2023-12-31"
+) |>
+  renameNWISColumns() |>
+  mutate(Date = yearmonth(Date)) |>
+  group_by(Date) |>
+  summarise(Flow = mean(Flow))
+
+glimpse(raw)
+```
+
+```{r}
+basin <- findNLDI(nwis = "06752260", find = "basin")
+
+sdate <- as.Date("2013-01-01")
+edate <- as.Date("2023-12-31")
+
+gm <- getTerraClim(
+  AOI       = basin$basin,
+  var       = c("tmax", "ppt", "srad"),
+  startDate = sdate,
+  endDate   = edate
+) |>
+  unlist() |>
+  rast() |>
+  exact_extract(basin$basin, "mean", progress = FALSE)
+
+historic <- mutate(gm, id = "gridmet") |>
+  pivot_longer(cols = -id) |>
+  mutate(name = sub("^mean\\.", "", name)) |>
+  tidyr::extract(name, into = c("var", "index"), "(.*)_([^_]+$)") |>
+  mutate(index = as.integer(index)) |>
+  mutate(Date = yearmonth(seq.Date(sdate, edate, by = "month")[as.numeric(index)])) |>
+  pivot_wider(id_cols = Date, names_from = var, values_from = value) |>
+  right_join(poudre_flow, by = "Date")
+
+# Validate: should have 132 rows (11 years × 12 months). If fewer, climate data
+# is missing for some months and those flow months were silently dropped.
+stopifnot("Climate join dropped flow months — check GridMET download" = nrow(historic) == 132)
+```
+
+```{r}
+sdate <- as.Date("2024-01-01")
+edate <- as.Date("2033-12-31")
+
+maca <- getMACA(
+  AOI      = basin$basin,
+  var      = c("tasmax", "pr", "rsds"),
+  timeRes  = "month",
+  startDate = sdate,
+  endDate   = edate
+) |>
+  unlist() |>
+  rast() |>
+  exact_extract(basin$basin, "mean", progress = FALSE)
+
+future <- mutate(maca, id = "maca") |>
+  pivot_longer(cols = -id) |>
+  mutate(name = sub("^mean\\.", "", name)) |>
+  tidyr::extract(name, into = c("var", "index"), "(.*)_([^_]+$)") |>
+  mutate(index = as.integer(index)) |>
+  mutate(Date = yearmonth(seq.Date(sdate, edate, by = "month")[as.numeric(index)])) |>
+  pivot_wider(id_cols = Date, names_from = var, values_from = value)
+
+# Rename the 3 climate columns to match GridMET names (Date column stays first)
+stopifnot("Unexpected MACA column count" = ncol(future) == 4)
+names(future)[2:4] <- c("ppt", "srad", "tmax")  # order matches getMACA var request
+future <- mutate(future, tmax = tmax - 273.15)   # Kelvin → °C
+```
+
+
+## Q1
+
+```{r}
+historic_ts <- as_tsibble(historic, index = Date)
+```
+
+
+## Q2
+
+```{r}
+# Static
+ggplot(historic_ts, aes(x = Date, y = Flow)) +
+  geom_line(color = "steelblue") +
+  labs(x = NULL, y = "Monthly mean flow (cfs)",
+       title = "Cache la Poudre at Mouth — monthly mean Q") +
+  theme_minimal()
+
+# Interactive
+plot_ly(historic_ts, x = ~as.Date(Date), y = ~Flow,
+        type = "scatter", mode = "lines")
+```
+
+## Q3
+
+```{r}
+library(feasts)
+
+# Subseries plot
+historic_ts |> gg_subseries(Flow) +
+  labs(y = "Flow (cfs)", title = "Subseries: one panel per month")
+
+# Seasonal plot
+historic_ts |> gg_season(Flow, labels = "right") +
+  labs(y = "Flow (cfs)", title = "Seasonal: one line per year")
+```
+
+Seasons are defined by seasonality by the index frequency. The tsibble is 1M with an implicit annual cycle. So each season is one calendar month and the cycle length is 12. This is mechanical rather than physical. The prompt feasts doesn't know may-june is typically when snow melts it just knows that month 5 and month 6 are the 5th and 6th place of 12. For the seasonal shape there is a unimodal annual cycle which peaks from May-June with the rising limb starting in April and receding in July back to base flow in October. The timing of the peak is relatively stable from year to year but the amplitude varies a lot.There is two parts to the physical processes of the May-June peak. First, snowmelt is the main driver from the surrounding mountains. The secondary process is the hydrograph is shaped by operations which are timed to agricultural needs and demands
+
+
+## Q4
+```{r}
+# Lag plot on log1p so peak months don't crush the rest of the data
+historic_ts |>
+  mutate(log_flow = log1p(Flow)) |>
+  gg_lag(log_flow, geom = "point", lags = c(1, 3, 6, 12)) +
+  labs(title = "Lag plot of log1p(Flow)",
+       x = "Lagged log_flow",
+       y = "log_flow")
+
+# Formal tests — both, because they have opposite nulls
+adf.test(historic_ts$Flow)    # H0: unit root (non-stationary)
+kpss.test(historic_ts$Flow)   # H0: stationary
+
+# feasts equivalents — these are more useful for monthly data
+historic_ts |> features(Flow, unitroot_kpss)
+historic_ts |> features(Flow, unitroot_ndiffs)
+historic_ts |> features(Flow, unitroot_nsdiffs)   # seasonal differencing
+```
+
+What do the tests tell you? If the series is non-stationary, ARIMA will need d ≥ 1 (differencing). Does the lag plot support the same conclusion?
+
+## Q5
+```{r}
+dcmp <- historic_ts |>
+  model(STL(Flow ~ trend(window = 21) +
+                   season(window = "periodic"),
+            robust = TRUE))
+
+components(dcmp) |> autoplot()
+```
+
+```{r}
+historic_tbl <- historic_ts |>
+  as_tibble() |>
+  mutate(date = as.Date(Date),
+         log_flow = log1p(Flow)) |>
+  select(date, tmax, ppt, srad, Flow, log_flow)
+
+future_tbl <- future |>
+  as_tibble() |>
+  mutate(date = as.Date(Date)) |>
+  select(date, tmax, ppt, srad)
+
+splits <- time_series_split(historic_tbl, assess = "24 months", cumulative = TRUE)
+```
+
+```{r}
+mods <- list(
+  arima         = arima_reg()                                |> set_engine("auto_arima"),
+  arima_boost   = arima_boost(min_n = 2, learn_rate = 0.015) |> set_engine("auto_arima_xgboost"),
+  prophet       = prophet_reg()                              |> set_engine("prophet"),
+  prophet_boost = prophet_boost(learn_rate = 0.1)            |> set_engine("prophet_xgboost"),
+  ets           = exp_smoothing()                            |> set_engine("ets")
+)
+```
+
+```{r}
+models_fit <- map(mods, ~ fit(.x, log_flow ~ .,
+                              data = select(training(splits), -Flow)))
+
+models_tbl <- as_modeltime_table(models_fit)
+```
+
+```{r}
+calib_tbl <- models_tbl |>
+  modeltime_calibrate(new_data = select(testing(splits), -Flow))
+
+calib_tbl |>
+  modeltime_accuracy() |>
+  arrange(mase)
+```
+
+```{r}
+forecast_tbl <- calib_tbl |>
+  modeltime_forecast(
+    new_data    = select(testing(splits), -Flow),
+    actual_data = historic_tbl
+  ) |>
+  mutate(
+    .value   = expm1(.value),
+    .conf_lo = expm1(pmax(.conf_lo, 0)),
+    .conf_hi = expm1(.conf_hi)
+  )
+
+forecast_tbl |> plot_modeltime_forecast()
+```
+
+```{r}
+refit_tbl <- calib_tbl |>
+  modeltime_refit(data = historic_tbl)
+```
+
+```{r}
+future_forecast <- refit_tbl |>
+  modeltime_forecast(
+    new_data    = future_tbl,
+    actual_data = historic_tbl
+  ) |>
+  mutate(
+    .value   = expm1(.value),
+    .conf_lo = expm1(pmax(.conf_lo, 0)),
+    .conf_hi = expm1(.conf_hi)
+  )
+
+future_forecast |> plot_modeltime_forecast()
+```
+
+```{r}
+upstream_raw <- readNWISdv(
+  siteNumber  = "06746095",
+  parameterCd = "00060",
+  startDate   = "2013-01-01",
+  endDate     = "2023-12-31"
+) |>
+  renameNWISColumns()
+
+names(upstream_raw) 
+upstream <- upstream_raw |>
+  mutate(date = floor_date(Date, "month")) |>     # replace `Date` with the actual name
+  group_by(date) |>
+  summarise(upstream_flow = mean(Flow, na.rm = TRUE), .groups = "drop")
+
+# Lab calls this pf_tbl — that's historic_tbl in our pipeline
+pf_reg <- historic_tbl |>
+  left_join(upstream, by = "date") |>
+  drop_na(upstream_flow)
+
+# Sanity check — how many months got dropped?
+nrow(historic_tbl) - nrow(pf_reg)
+```
+
+```{r}
+splits_reg <- time_series_split(pf_reg, assess = "24 months", cumulative = TRUE)
+
+models_reg <- map(mods, ~ fit(.x, log_flow ~ .,
+                              data = select(training(splits_reg), -Flow)))
+
+models_reg_tbl <- as_modeltime_table(models_reg)
+
+calib_reg_tbl <- models_reg_tbl |>
+  modeltime_calibrate(new_data = select(testing(splits_reg), -Flow))
+
+# Side-by-side MASE comparison
+acc_base <- calib_tbl |> modeltime_accuracy() |>
+  select(.model_desc, mase) |> rename(mase_climate = mase)
+
+acc_reg <- calib_reg_tbl |> modeltime_accuracy() |>
+  select(.model_desc, mase) |> rename(mase_with_upstream = mase)
+
+left_join(acc_base, acc_reg, by = ".model_desc") |>
+  mutate(delta = mase_climate - mase_with_upstream) |>
+  arrange(desc(delta))
+```
+
+Describe what you see:
+
+What does the trend tell you about long-term changes in Poudre flow? Is there evidence of a decline consistent with climate change or upstream demand?
+What drives the seasonal component? (Hint: snowmelt, irrigation withdrawals, reservoir releases)
+Are there any spikes in the remainder that correspond to anomalous years you can identify?
+
+Examine your 10-year forecast and reflect on the following:
+
+Model agreement: Do ARIMA and Prophet project similar trajectories? If they diverge, what does that tell you about their different assumptions (statistical stationarity vs. flexible trend)?
+
+Forecast quality: Which model would you recommend to CWCB for water-supply planning? Justify with your accuracy metrics.
+
+Negative predictions: If any model predicts negative flow, explain why this happens and what you would do to fix it in a production context (hint: log-transformation of Flow before modeling).
+
+Regressor value: The MACA climate projections assume a specific emissions scenario. How does uncertainty in those projections propagate into your streamflow forecast?
+
+Improvement path: What information not in tmax, ppt, srad would most improve this forecast? (Consider: snowpack, upstream storage, irrigation demand.)
+
+## Extra: add an upstream regressor
